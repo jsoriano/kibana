@@ -11,11 +11,15 @@ import { createAppContextStartContractMock } from '../../mocks';
 import { appContextService } from '../../services';
 import { packagePolicyService } from '../../services/package_policy';
 import { installPackage } from '../../services/epm/packages';
+import * as Registry from '../../services/epm/registry';
+import { getInstallationsByName } from '../../services/epm/packages/get';
 
 import { _runBulkUpgradeTask } from './run_bulk_upgrade';
 
 jest.mock('../../services/epm/packages');
 jest.mock('../../services/package_policy');
+jest.mock('../../services/epm/registry');
+jest.mock('../../services/epm/packages/get');
 
 describe('Bulk upgrade task', () => {
   beforeEach(() => {
@@ -48,6 +52,22 @@ describe('Bulk upgrade task', () => {
     jest
       .mocked(packagePolicyService.bulkUpgrade)
       .mockResolvedValue([{ success: true }, { success: true }] as any);
+
+    // Mock Registry functions for dependency resolution
+    jest.mocked(Registry.fetchFindLatestPackageOrThrow).mockImplementation(async (pkgName) => ({
+      name: pkgName,
+      version: '1.0.0',
+    }));
+
+    jest.mocked(Registry.getPackage).mockImplementation(async (pkgName, pkgVersion) => ({
+      packageInfo: {
+        name: pkgName,
+        version: pkgVersion || '1.0.0',
+      },
+    }));
+
+    // Mock getInstallationsByName to return empty (no installed packages)
+    jest.mocked(getInstallationsByName).mockResolvedValue([]);
   });
   describe('_runBulkUpgradeTask', () => {
     it('should work for successfull upgrade', async () => {
