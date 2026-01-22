@@ -18,7 +18,12 @@ import type {
 } from '../../constants';
 import type { CloudConnectors, ValueOf } from '..';
 
-import type { PackageSpecManifest, PackageSpecIcon, PackageSpecCategory } from './package_spec';
+import type {
+  PackageSpecManifest,
+  PackageSpecIcon,
+  PackageSpecCategory,
+  PackageRequirements,
+} from './package_spec';
 
 export type InstallationStatus = typeof installationStatuses;
 

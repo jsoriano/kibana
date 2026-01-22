@@ -45,15 +45,16 @@ import { deleteComponentTemplates } from '../elasticsearch/template/remove';
 import { removeArchiveEntries } from '../archive/storage';
 
 import { auditLoggingService } from '../../audit_logging';
-import { FleetError, PackageRemovalError } from '../../../errors';
+import { FleetError, PackageRemovalError, PackageHasDependentsError } from '../../../errors';
 
 import { populatePackagePolicyAssignedAgentsCount } from '../../package_policies/populate_package_policy_assigned_agents_count';
 import { deleteEsqlViews } from '../elasticsearch/esql_views/remove';
 import type { PackageSpecConditions } from '../../../../common';
 
-import { getInstallation, getPackageInfo, kibanaSavedObjectTypes } from '.';
+import { getInstallation, getPackageInfo, kibanaSavedObjectTypes, getPackageSavedObjects } from '.';
 import { updateUninstallFailedAttempts } from './uninstall_errors_helpers';
 import { deletePackageKnowledgeBase } from './knowledge_base_index';
+import { checkDependentsBeforeRemoval, packageInfoToPackageWithDependencies } from './resolve_dependencies';
 
 const MAX_ASSETS_TO_DELETE = 1000;
 
@@ -95,6 +96,46 @@ export async function removeInstallation(options: {
       const error = new PackageRemovalError(
         `Unable to remove package ${pkgName}:${pkgVersion} with existing package policy(s) in use by agent(s)`
       );
+      await updateUninstallStatusToFailed(savedObjectsClient, pkgName, error);
+      throw error;
+    }
+  }
+
+  // Check if other installed packages depend on this package
+  if (!options.force) {
+    const logger = appContextService.getLogger();
+    logger.debug(`Checking for packages that depend on ${pkgName} before removal`);
+
+    // Get all installed packages to check their dependencies
+    const allInstalledPackages = await getPackageSavedObjects(savedObjectsClient);
+
+    // Fetch package info for each to get their dependencies
+    const installedPackagesWithDeps = await Promise.all(
+      allInstalledPackages.saved_objects
+        .filter((pkg) => pkg.id !== pkgName) // Exclude the package being removed
+        .map(async (pkg) => {
+          try {
+            const pkgInfo = await getPackageInfo({
+              savedObjectsClient,
+              pkgName: pkg.id,
+              pkgVersion: pkg.attributes.version,
+              skipArchive: true,
+            });
+            return packageInfoToPackageWithDependencies(pkgInfo);
+          } catch {
+            return {
+              name: pkg.id,
+              version: pkg.attributes.version,
+              dependencies: undefined,
+            };
+          }
+        })
+    );
+
+    const dependents = checkDependentsBeforeRemoval(pkgName, installedPackagesWithDeps);
+
+    if (dependents.length > 0) {
+      const error = new PackageHasDependentsError(pkgName, dependents);
       await updateUninstallStatusToFailed(savedObjectsClient, pkgName, error);
       throw error;
     }

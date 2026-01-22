@@ -101,6 +101,11 @@ import { addErrorToLatestFailedAttempts } from './install_errors_helpers';
 import { setLastUploadInstallCache, getLastUploadInstallCache } from './utils';
 import { removeInstallation } from './remove';
 import { shouldIncludePackageWithDatastreamTypes } from './exclude_datastreams_helper';
+import {
+  resolvePackageDependencies,
+  packageInfoToPackageWithDependencies,
+  throwOnResolutionFailure,
+} from './resolve_dependencies';
 
 export const UPLOAD_RETRY_AFTER_MS = 10000; // 10s
 const MAX_ENSURE_INSTALL_TIME = 60 * 1000;
@@ -754,6 +759,58 @@ export async function installPackageWithStateMachine(options: {
         errorMessage: err.message,
       });
       return { error: err, installType, installSource, pkgName };
+    }
+
+    // Resolve and validate package dependencies before installation
+    const packageWithDeps = packageInfoToPackageWithDependencies(packageInfo);
+    if (packageWithDeps.dependencies && packageWithDeps.dependencies.length > 0) {
+      logger.debug(
+        `Resolving dependencies for ${pkgName}@${pkgVersion}: ${packageWithDeps.dependencies
+          .map((d) => `${d.name}@${d.version}`)
+          .join(', ')}`
+      );
+
+      const dependencyResolution = await resolvePackageDependencies({
+        savedObjectsClient,
+        packagesToInstall: [packageWithDeps],
+        fetchAvailableVersions: async (depName: string) => {
+          // Fetch available versions from registry for uninstalled dependencies
+          const versions = await Registry.fetchFindLatestPackageOrThrow(depName, {
+            prerelease: false,
+          });
+          return [versions.version];
+        },
+      });
+
+      throwOnResolutionFailure(dependencyResolution);
+
+      // Install dependencies first if there are any that need to be installed
+      if (dependencyResolution.installOrder && dependencyResolution.installOrder.length > 1) {
+        const depsToInstall = dependencyResolution.installOrder.filter(
+          (dep) => dep.name !== pkgName
+        );
+
+        for (const dep of depsToInstall) {
+          logger.info(`Installing dependency ${dep.name}@${dep.version} for ${pkgName}`);
+          const depPkgKey = Registry.pkgToPkgKey({ name: dep.name, version: dep.version });
+
+          // Recursively install dependencies
+          const depResult = await installPackage({
+            installSource: 'registry',
+            savedObjectsClient,
+            pkgkey: depPkgKey,
+            esClient,
+            spaceId,
+            force: false,
+            authorizationHeader,
+          });
+
+          if (depResult.error) {
+            logger.error(`Failed to install dependency ${dep.name}: ${depResult.error.message}`);
+            throw depResult.error;
+          }
+        }
+      }
     }
 
     // Saved object client need to be scopped with the package space for saved object tagging

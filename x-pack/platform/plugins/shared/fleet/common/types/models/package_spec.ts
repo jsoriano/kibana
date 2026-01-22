@@ -42,6 +42,11 @@ export interface PackageSpecManifest {
     }>;
     datasets?: DiscoveryDataset[];
   };
+  /**
+   * Package requirements (dependencies) that must be installed before this package.
+   * Separated into input packages (can be referenced by policy templates) and content packages.
+   */
+  requires?: PackageRequirements;
 }
 export interface DiscoveryDataset {
   name: string;
@@ -152,4 +157,27 @@ export interface PackageSpecScreenshot {
   size?: string;
   type?: string;
   path?: string;
+}
+
+/**
+ * Represents a package dependency with a semver version constraint.
+ * Example: { name: "filebeat", version: "^1.0.0" }
+ */
+export interface PackageDependency {
+  /** The name of the required package */
+  name: string;
+  /** A semver version constraint (e.g., "^1.0.0", ">=2.0.0 <3.0.0", "~1.2.3") */
+  version: string;
+}
+
+/**
+ * Defines package requirements separated by package type.
+ * This separation enables static validation that policy templates only reference
+ * input packages that are declared in the requires.input list.
+ */
+export interface PackageRequirements {
+  /** Required input packages (type: 'input') - can be referenced by policy templates */
+  input?: PackageDependency[];
+  /** Required content packages (type: 'content') - provide dashboards, visualizations, etc. */
+  content?: PackageDependency[];
 }

@@ -78,6 +78,48 @@ export class KibanaSOReferenceError extends FleetError {}
 export class PackageAlreadyInstalledError extends FleetError {}
 export class PackageRollbackError extends FleetError {}
 
+// Package dependency errors
+export class PackageDependencyError extends FleetError {}
+export class PackageDependencyConflictError extends PackageDependencyError {
+  constructor(message: string) {
+    super(message);
+    this.attributes = {
+      type: 'dependency_conflict',
+    };
+  }
+}
+export class PackageDependencyCycleError extends PackageDependencyError {
+  constructor(message: string) {
+    super(message);
+    this.attributes = {
+      type: 'dependency_cycle',
+    };
+  }
+}
+export class PackageDependencyValidationError extends PackageDependencyError {
+  constructor(message: string) {
+    super(message);
+    this.attributes = {
+      type: 'dependency_validation',
+    };
+  }
+}
+export class PackageHasDependentsError extends PackageDependencyError {
+  constructor(
+    packageName: string,
+    dependents: Array<{ name: string; version: string }>
+  ) {
+    const dependentsList = dependents.map((d) => `${d.name}@${d.version}`).join(', ');
+    super(
+      `Cannot uninstall package "${packageName}" because it is required by: ${dependentsList}`
+    );
+    this.attributes = {
+      type: 'package_has_dependents',
+      dependents,
+    };
+  }
+}
+
 export class AgentPolicyError extends FleetError {}
 export class AgentRequestInvalidError extends FleetError {}
 export class AgentPolicyInvalidError extends FleetError {}
