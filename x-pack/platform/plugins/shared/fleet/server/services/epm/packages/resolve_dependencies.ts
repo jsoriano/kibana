@@ -9,7 +9,7 @@ import semverSatisfies from 'semver/functions/satisfies';
 import semverIntersects from 'semver/ranges/intersects';
 import semverValidRange from 'semver/ranges/valid';
 import semverMaxSatisfying from 'semver/ranges/max-satisfying';
-import type { SavedObjectsClientContract } from '@kbn/core/server';
+import type { Logger, SavedObjectsClientContract } from '@kbn/core/server';
 
 import type {
   PackageDependency,
@@ -23,13 +23,21 @@ import {
   PackageDependencyValidationError,
 } from '../../../errors';
 
+import * as Registry from '../registry';
+
 import { getInstallationsByName } from './get';
 
+// ============================================================================
+// Public Types
+// ============================================================================
+
 /**
- * Represents a package with its requirements (dependencies) for resolution
+ * Represents a package with its requirements (dependencies) for resolution.
  */
 export interface PackageWithDependencies {
+  /** Package name */
   name: string;
+  /** Package version */
   version: string;
   /** Combined dependencies from requires.input and requires.content */
   dependencies?: PackageDependency[];
@@ -38,7 +46,7 @@ export interface PackageWithDependencies {
 }
 
 /**
- * Represents a package constraint requirement from another package
+ * Represents a package constraint requirement from another package.
  */
 export interface PackageConstraint {
   /** The name of the package that has this constraint */
@@ -50,7 +58,7 @@ export interface PackageConstraint {
 }
 
 /**
- * A conflict where multiple packages require incompatible versions of a dependency
+ * A conflict where multiple packages require incompatible versions of a dependency.
  */
 export interface DependencyConflict {
   /** The name of the package that has conflicting requirements */
@@ -62,7 +70,7 @@ export interface DependencyConflict {
 }
 
 /**
- * Result of dependency resolution
+ * Result of dependency resolution.
  */
 export interface DependencyResolutionResult {
   /** Whether all dependencies can be satisfied */
@@ -75,8 +83,12 @@ export interface DependencyResolutionResult {
   cycle?: string[];
 }
 
+// ============================================================================
+// Internal Types
+// ============================================================================
+
 /**
- * Internal node for building the dependency graph
+ * Internal node for building the dependency graph.
  */
 interface DependencyNode {
   name: string;
@@ -87,7 +99,24 @@ interface DependencyNode {
 }
 
 /**
- * Build a dependency graph from installed packages and packages to be installed
+ * Result of constraint compatibility check.
+ */
+interface ConstraintCompatibilityResult {
+  compatible: boolean;
+  /** A representative constraint that can be used to find satisfying versions */
+  representativeConstraint?: string;
+}
+
+// ============================================================================
+// Graph Building
+// ============================================================================
+
+/**
+ * Build a dependency graph from installed packages and packages to be installed.
+ *
+ * @param installedPackages - Currently installed packages
+ * @param packagesToInstall - Packages that will be installed (these override installed versions)
+ * @returns A map of package names to dependency nodes
  */
 function buildDependencyGraph(
   installedPackages: Installation[],
@@ -95,9 +124,8 @@ function buildDependencyGraph(
 ): Map<string, DependencyNode> {
   const graph = new Map<string, DependencyNode>();
 
-  // Add installed packages to the graph
+  // Add installed packages to the graph (skip those being replaced)
   for (const pkg of installedPackages) {
-    // Skip packages that will be replaced by installation
     if (packagesToInstall.some((p) => p.name === pkg.name)) {
       continue;
     }
@@ -105,14 +133,12 @@ function buildDependencyGraph(
     graph.set(pkg.name, {
       name: pkg.name,
       version: pkg.version,
-      // Installed packages don't have dependencies in the Installation type,
-      // they would need to be fetched separately if needed
       dependencies: [],
       constraints: [],
     });
   }
 
-  // Add packages to install to the graph (overriding if already installed)
+  // Add packages to install to the graph
   for (const pkg of packagesToInstall) {
     graph.set(pkg.name, {
       name: pkg.name,
@@ -126,25 +152,21 @@ function buildDependencyGraph(
   for (const [, node] of graph) {
     for (const dep of node.dependencies) {
       const depNode = graph.get(dep.name);
+      const constraint: PackageConstraint = {
+        requiredBy: node.name,
+        requiredByVersion: node.version,
+        constraint: dep.version,
+      };
+
       if (depNode) {
-        depNode.constraints.push({
-          requiredBy: node.name,
-          requiredByVersion: node.version,
-          constraint: dep.version,
-        });
+        depNode.constraints.push(constraint);
       } else {
         // Dependency not in graph - it needs to be installed
         graph.set(dep.name, {
           name: dep.name,
           version: '', // Version to be resolved
           dependencies: [],
-          constraints: [
-            {
-              requiredBy: node.name,
-              requiredByVersion: node.version,
-              constraint: dep.version,
-            },
-          ],
+          constraints: [constraint],
         });
       }
     }
@@ -153,19 +175,25 @@ function buildDependencyGraph(
   return graph;
 }
 
+// ============================================================================
+// Constraint Checking
+// ============================================================================
+
 /**
- * Check if all constraints on a package can be satisfied by a single version
+ * Check if all constraints on a package can be satisfied by a single version.
+ *
+ * @param constraints - Array of constraints from different packages
+ * @returns Whether the constraints are compatible and a representative constraint
  */
-function checkConstraintCompatibility(constraints: PackageConstraint[]): {
-  compatible: boolean;
-  mergedConstraint?: string;
-} {
+function checkConstraintCompatibility(
+  constraints: PackageConstraint[]
+): ConstraintCompatibilityResult {
   if (constraints.length === 0) {
     return { compatible: true };
   }
 
   if (constraints.length === 1) {
-    return { compatible: true, mergedConstraint: constraints[0].constraint };
+    return { compatible: true, representativeConstraint: constraints[0].constraint };
   }
 
   // Check if all constraints can intersect (have a common satisfying version range)
@@ -174,24 +202,35 @@ function checkConstraintCompatibility(constraints: PackageConstraint[]): {
       const range1 = constraints[i].constraint;
       const range2 = constraints[j].constraint;
 
-      // Validate ranges
       if (!semverValidRange(range1) || !semverValidRange(range2)) {
         return { compatible: false };
       }
 
-      // Check if ranges intersect
       if (!semverIntersects(range1, range2)) {
         return { compatible: false };
       }
     }
   }
 
-  // All constraints are compatible - return the most restrictive (first one for simplicity)
-  return { compatible: true, mergedConstraint: constraints[0].constraint };
+  // All constraints are compatible - return the first one as representative
+  return { compatible: true, representativeConstraint: constraints[0].constraint };
 }
 
 /**
- * Check if a specific version satisfies all constraints
+ * Check if a specific version satisfies all constraints.
+ *
+ * @param version - The version to check
+ * @param constraints - Array of constraints to satisfy
+ * @returns Whether the version satisfies all constraints
+ *
+ * @example
+ * ```ts
+ * const constraints = [
+ *   { requiredBy: 'pkg1', requiredByVersion: '1.0.0', constraint: '^1.0.0' },
+ *   { requiredBy: 'pkg2', requiredByVersion: '2.0.0', constraint: '>=1.0.0 <2.0.0' },
+ * ];
+ * versionSatisfiesAllConstraints('1.5.0', constraints); // true
+ * ```
  */
 export function versionSatisfiesAllConstraints(
   version: string,
@@ -200,8 +239,15 @@ export function versionSatisfiesAllConstraints(
   return constraints.every((c) => semverSatisfies(version, c.constraint));
 }
 
+// ============================================================================
+// Cycle Detection
+// ============================================================================
+
 /**
- * Detect cycles in the dependency graph using DFS
+ * Detect cycles in the dependency graph using depth-first search.
+ *
+ * @param graph - The dependency graph to check
+ * @returns The cycle path if found, or null if no cycles exist
  */
 function detectCycles(graph: Map<string, DependencyNode>): string[] | null {
   const visited = new Set<string>();
@@ -220,7 +266,6 @@ function detectCycles(graph: Map<string, DependencyNode>): string[] | null {
           const cycle = dfs(dep.name);
           if (cycle) return cycle;
         } else if (recursionStack.has(dep.name)) {
-          // Found a cycle - return the cycle path
           const cycleStart = path.indexOf(dep.name);
           return path.slice(cycleStart).concat(dep.name);
         }
@@ -242,8 +287,139 @@ function detectCycles(graph: Map<string, DependencyNode>): string[] | null {
   return null;
 }
 
+// ============================================================================
+// Conflict Detection
+// ============================================================================
+
 /**
- * Topologically sort packages so dependencies come before dependents
+ * Create a conflict message for incompatible constraints.
+ */
+function createIncompatibleConstraintsConflict(
+  pkgName: string,
+  constraints: PackageConstraint[]
+): DependencyConflict {
+  return {
+    dependency: pkgName,
+    constraints,
+    message: `Package "${pkgName}" has incompatible version requirements:\n${constraints
+      .map((c) => `  - ${c.requiredBy}@${c.requiredByVersion} requires ${pkgName} ${c.constraint}`)
+      .join('\n')}`,
+  };
+}
+
+/**
+ * Create a conflict message for version not satisfying constraints.
+ */
+function createVersionMismatchConflict(
+  pkgName: string,
+  version: string,
+  unsatisfiedConstraints: PackageConstraint[]
+): DependencyConflict {
+  return {
+    dependency: pkgName,
+    constraints: unsatisfiedConstraints,
+    message: `Package "${pkgName}@${version}" does not satisfy version requirements:\n${unsatisfiedConstraints
+      .map((c) => `  - ${c.requiredBy}@${c.requiredByVersion} requires ${pkgName} ${c.constraint}`)
+      .join('\n')}`,
+  };
+}
+
+/**
+ * Create a conflict message for unavailable version.
+ */
+function createNoAvailableVersionConflict(
+  pkgName: string,
+  constraint: string,
+  availableVersions: string[],
+  constraints: PackageConstraint[]
+): DependencyConflict {
+  return {
+    dependency: pkgName,
+    constraints,
+    message: `No available version of "${pkgName}" satisfies constraint ${constraint}. Available versions: ${availableVersions.join(
+      ', '
+    )}`,
+  };
+}
+
+/**
+ * Detect version conflicts in the dependency graph.
+ *
+ * @param graph - The dependency graph to check
+ * @param availableVersions - Optional map of available versions for uninstalled dependencies
+ * @returns Array of conflicts found
+ */
+function detectVersionConflicts(
+  graph: Map<string, DependencyNode>,
+  availableVersions?: Map<string, string[]>
+): DependencyConflict[] {
+  const conflicts: DependencyConflict[] = [];
+
+  for (const [pkgName, node] of graph) {
+    // Check multiple constraint compatibility
+    if (node.constraints.length > 1) {
+      const { compatible } = checkConstraintCompatibility(node.constraints);
+      if (!compatible) {
+        conflicts.push(createIncompatibleConstraintsConflict(pkgName, node.constraints));
+        continue;
+      }
+    }
+
+    // Check if installed/to-be-installed version satisfies all constraints
+    if (node.version && node.constraints.length > 0) {
+      if (!versionSatisfiesAllConstraints(node.version, node.constraints)) {
+        const unsatisfiedConstraints = node.constraints.filter(
+          (c) => !semverSatisfies(node.version, c.constraint)
+        );
+        conflicts.push(
+          createVersionMismatchConflict(pkgName, node.version, unsatisfiedConstraints)
+        );
+        continue;
+      }
+    }
+
+    // Check if unresolved dependency can be satisfied
+    if (!node.version && node.constraints.length > 0) {
+      const { compatible, representativeConstraint } = checkConstraintCompatibility(
+        node.constraints
+      );
+
+      if (!compatible) {
+        conflicts.push(createIncompatibleConstraintsConflict(pkgName, node.constraints));
+      } else if (availableVersions && representativeConstraint) {
+        const versions = availableVersions.get(pkgName);
+        if (versions) {
+          const satisfyingVersion = semverMaxSatisfying(versions, representativeConstraint);
+          if (satisfyingVersion) {
+            node.version = satisfyingVersion;
+          } else {
+            conflicts.push(
+              createNoAvailableVersionConflict(
+                pkgName,
+                representativeConstraint,
+                versions,
+                node.constraints
+              )
+            );
+          }
+        }
+      }
+    }
+  }
+
+  return conflicts;
+}
+
+// ============================================================================
+// Topological Sort
+// ============================================================================
+
+/**
+ * Topologically sort packages so dependencies come before dependents.
+ *
+ * @param graph - The dependency graph
+ * @param packagesToInstall - Set of package names that need to be installed
+ * @returns Sorted list of package names
  */
 function topologicalSort(
   graph: Map<string, DependencyNode>,
@@ -263,7 +439,6 @@ function topologicalSort(
       }
     }
 
-    // Only include packages that need to be installed
     if (packagesToInstall.has(nodeName)) {
       result.push(nodeName);
     }
@@ -276,8 +451,26 @@ function topologicalSort(
   return result;
 }
 
+// ============================================================================
+// Validation
+// ============================================================================
+
 /**
- * Validate that a package's dependencies have valid semver constraints
+ * Validate that a package's dependencies have valid semver constraints.
+ *
+ * @param pkg - The package to validate
+ * @throws {PackageDependencyValidationError} If any dependency is invalid
+ *
+ * @example
+ * ```ts
+ * validateDependencies({
+ *   name: 'nginx',
+ *   version: '1.0.0',
+ *   dependencies: [
+ *     { name: 'apache', version: '^1.0.0' },
+ *   ],
+ * }); // passes
+ * ```
  */
 export function validateDependencies(pkg: PackageWithDependencies): void {
   if (!pkg.dependencies) return;
@@ -301,126 +494,73 @@ export function validateDependencies(pkg: PackageWithDependencies): void {
       );
     }
 
-    // Prevent self-dependency
     if (dep.name === pkg.name) {
-      throw new PackageDependencyValidationError(
-        `Package ${pkg.name} cannot depend on itself`
-      );
+      throw new PackageDependencyValidationError(`Package ${pkg.name} cannot depend on itself`);
     }
   }
 }
 
+// ============================================================================
+// Main Resolution Function
+// ============================================================================
+
 /**
  * Resolve dependencies for a set of packages to be installed.
  *
- * This function:
+ * This function performs the following steps:
  * 1. Validates all dependency constraints are valid semver ranges
- * 2. Checks for conflicts where different packages require incompatible versions
+ * 2. Builds a dependency graph from installed and to-be-installed packages
  * 3. Detects circular dependencies
- * 4. Returns a topologically sorted installation order (dependencies first)
+ * 4. Checks for version conflicts
+ * 5. Returns a topologically sorted installation order (dependencies first)
  *
- * @param installedPackages Currently installed packages
- * @param packagesToInstall Packages that should be installed (with their dependencies)
- * @param availableVersions Optional map of package names to available versions (for resolving uninstalled deps)
- * @returns Resolution result with install order or conflict information
+ * @param installedPackages - Currently installed packages
+ * @param packagesToInstall - Packages that should be installed (with their dependencies)
+ * @param availableVersions - Optional map of package names to available versions
+ * @returns Resolution result with install order or conflict/cycle information
+ *
+ * @example
+ * ```ts
+ * const result = resolveDependencies(
+ *   [{ name: 'filebeat', version: '1.5.0', ... }],
+ *   [{ name: 'nginx', version: '1.0.0', dependencies: [{ name: 'filebeat', version: '^1.0.0' }] }]
+ * );
+ *
+ * if (result.success) {
+ *   console.log('Install order:', result.installOrder);
+ * } else if (result.cycle) {
+ *   console.error('Cycle detected:', result.cycle);
+ * } else {
+ *   console.error('Conflicts:', result.conflicts);
+ * }
+ * ```
  */
 export function resolveDependencies(
   installedPackages: Installation[],
   packagesToInstall: PackageWithDependencies[],
   availableVersions?: Map<string, string[]>
 ): DependencyResolutionResult {
-  // Validate all dependencies first
+  // Step 1: Validate all dependencies
   for (const pkg of packagesToInstall) {
     validateDependencies(pkg);
   }
 
-  // Build the dependency graph
+  // Step 2: Build the dependency graph
   const graph = buildDependencyGraph(installedPackages, packagesToInstall);
 
-  // Detect cycles
+  // Step 3: Detect cycles
   const cycle = detectCycles(graph);
   if (cycle) {
-    return {
-      success: false,
-      cycle,
-    };
+    return { success: false, cycle };
   }
 
-  // Check for conflicts
-  const conflicts: DependencyConflict[] = [];
-
-  for (const [pkgName, node] of graph) {
-    if (node.constraints.length > 1) {
-      const { compatible } = checkConstraintCompatibility(node.constraints);
-
-      if (!compatible) {
-        conflicts.push({
-          dependency: pkgName,
-          constraints: node.constraints,
-          message: `Package "${pkgName}" has incompatible version requirements:\n${node.constraints
-            .map((c) => `  - ${c.requiredBy}@${c.requiredByVersion} requires ${pkgName} ${c.constraint}`)
-            .join('\n')}`,
-        });
-      }
-    }
-
-    // Check if installed/to-be-installed version satisfies all constraints
-    if (node.version && node.constraints.length > 0) {
-      if (!versionSatisfiesAllConstraints(node.version, node.constraints)) {
-        // Find which constraints are not satisfied
-        const unsatisfiedConstraints = node.constraints.filter(
-          (c) => !semverSatisfies(node.version, c.constraint)
-        );
-
-        conflicts.push({
-          dependency: pkgName,
-          constraints: unsatisfiedConstraints,
-          message: `Package "${pkgName}@${node.version}" does not satisfy version requirements:\n${unsatisfiedConstraints
-            .map((c) => `  - ${c.requiredBy}@${c.requiredByVersion} requires ${pkgName} ${c.constraint}`)
-            .join('\n')}`,
-        });
-      }
-    }
-
-    // Check if unresolved dependency (version is empty) can be satisfied
-    if (!node.version && node.constraints.length > 0) {
-      const { compatible, mergedConstraint } = checkConstraintCompatibility(node.constraints);
-
-      if (!compatible) {
-        conflicts.push({
-          dependency: pkgName,
-          constraints: node.constraints,
-          message: `Package "${pkgName}" has incompatible version requirements:\n${node.constraints
-            .map((c) => `  - ${c.requiredBy}@${c.requiredByVersion} requires ${pkgName} ${c.constraint}`)
-            .join('\n')}`,
-        });
-      } else if (availableVersions) {
-        // Try to find a satisfying version
-        const versions = availableVersions.get(pkgName);
-        if (versions && mergedConstraint) {
-          const satisfyingVersion = semverMaxSatisfying(versions, mergedConstraint);
-          if (satisfyingVersion) {
-            node.version = satisfyingVersion;
-          } else {
-            conflicts.push({
-              dependency: pkgName,
-              constraints: node.constraints,
-              message: `No available version of "${pkgName}" satisfies constraint ${mergedConstraint}. Available versions: ${versions.join(', ')}`,
-            });
-          }
-        }
-      }
-    }
-  }
-
+  // Step 4: Check for conflicts
+  const conflicts = detectVersionConflicts(graph, availableVersions);
   if (conflicts.length > 0) {
-    return {
-      success: false,
-      conflicts,
-    };
+    return { success: false, conflicts };
   }
 
-  // Determine which packages need to be installed
+  // Step 5: Determine which packages need to be installed
   const packagesToInstallSet = new Set<string>(packagesToInstall.map((p) => p.name));
 
   // Add unresolved dependencies that need to be installed
@@ -430,7 +570,7 @@ export function resolveDependencies(
     }
   }
 
-  // Get topologically sorted install order
+  // Step 6: Get topologically sorted install order
   const installOrder = topologicalSort(graph, packagesToInstallSet);
 
   return {
@@ -442,12 +582,24 @@ export function resolveDependencies(
   };
 }
 
+// ============================================================================
+// Removal Check
+// ============================================================================
+
 /**
  * Check if uninstalling a package would break dependencies of other installed packages.
  *
- * @param packageToRemove Name of the package to remove
- * @param installedPackages All currently installed packages with their dependencies
+ * @param packageToRemove - Name of the package to remove
+ * @param installedPackages - All currently installed packages with their dependencies
  * @returns List of packages that depend on the package being removed
+ *
+ * @example
+ * ```ts
+ * const dependents = checkDependentsBeforeRemoval('filebeat', installedPackages);
+ * if (dependents.length > 0) {
+ *   console.error('Cannot remove, required by:', dependents);
+ * }
+ * ```
  */
 export function checkDependentsBeforeRemoval(
   packageToRemove: string,
@@ -466,9 +618,16 @@ export function checkDependentsBeforeRemoval(
   return dependents;
 }
 
+// ============================================================================
+// Async Helpers
+// ============================================================================
+
 /**
  * Async helper to resolve dependencies with package info fetching.
  * This retrieves the installed packages and validates the installation plan.
+ *
+ * @param options - Resolution options
+ * @returns Resolution result
  */
 export async function resolvePackageDependencies(options: {
   savedObjectsClient: SavedObjectsClientContract;
@@ -477,60 +636,93 @@ export async function resolvePackageDependencies(options: {
 }): Promise<DependencyResolutionResult> {
   const { savedObjectsClient, packagesToInstall, fetchAvailableVersions } = options;
 
-  // Get all installed packages
-  const installedPackageNames = new Set<string>();
-
-  // Collect all package names we need to check (installed + to install + dependencies)
-  for (const pkg of packagesToInstall) {
-    installedPackageNames.add(pkg.name);
-    if (pkg.dependencies) {
-      for (const dep of pkg.dependencies) {
-        installedPackageNames.add(dep.name);
-      }
-    }
-  }
+  // Collect all package names we need to check
+  const packageNames = collectAllPackageNames(packagesToInstall);
 
   // Fetch installed packages
   const installations = await getInstallationsByName({
     savedObjectsClient,
-    pkgNames: Array.from(installedPackageNames),
+    pkgNames: Array.from(packageNames),
   });
 
   // Fetch available versions for uninstalled dependencies if callback provided
   let availableVersions: Map<string, string[]> | undefined;
   if (fetchAvailableVersions) {
-    availableVersions = new Map();
-    const uninstalledDeps = new Set<string>();
-
-    for (const pkg of packagesToInstall) {
-      if (pkg.dependencies) {
-        for (const dep of pkg.dependencies) {
-          const isInstalled = installations.some((i) => i.name === dep.name);
-          const willBeInstalled = packagesToInstall.some((p) => p.name === dep.name);
-          if (!isInstalled && !willBeInstalled) {
-            uninstalledDeps.add(dep.name);
-          }
-        }
-      }
-    }
-
-    for (const depName of uninstalledDeps) {
-      try {
-        const versions = await fetchAvailableVersions(depName);
-        availableVersions.set(depName, versions);
-      } catch {
-        // If we can't fetch versions, the resolution will fail with appropriate error
-      }
-    }
+    availableVersions = await fetchAvailableVersionsForUninstalledDeps(
+      packagesToInstall,
+      installations,
+      fetchAvailableVersions
+    );
   }
 
   return resolveDependencies(installations, packagesToInstall, availableVersions);
 }
 
 /**
+ * Collect all package names from packages and their dependencies.
+ */
+function collectAllPackageNames(packages: PackageWithDependencies[]): Set<string> {
+  const names = new Set<string>();
+
+  for (const pkg of packages) {
+    names.add(pkg.name);
+    if (pkg.dependencies) {
+      for (const dep of pkg.dependencies) {
+        names.add(dep.name);
+      }
+    }
+  }
+
+  return names;
+}
+
+/**
+ * Fetch available versions for dependencies that are not installed.
+ */
+async function fetchAvailableVersionsForUninstalledDeps(
+  packagesToInstall: PackageWithDependencies[],
+  installations: Installation[],
+  fetchAvailableVersions: (pkgName: string) => Promise<string[]>
+): Promise<Map<string, string[]>> {
+  const availableVersions = new Map<string, string[]>();
+  const uninstalledDeps = new Set<string>();
+
+  for (const pkg of packagesToInstall) {
+    if (pkg.dependencies) {
+      for (const dep of pkg.dependencies) {
+        const isInstalled = installations.some((i) => i.name === dep.name);
+        const willBeInstalled = packagesToInstall.some((p) => p.name === dep.name);
+        if (!isInstalled && !willBeInstalled) {
+          uninstalledDeps.add(dep.name);
+        }
+      }
+    }
+  }
+
+  for (const depName of uninstalledDeps) {
+    try {
+      const versions = await fetchAvailableVersions(depName);
+      availableVersions.set(depName, versions);
+    } catch {
+      // If we can't fetch versions, the resolution will fail with appropriate error
+    }
+  }
+
+  return availableVersions;
+}
+
+// ============================================================================
+// Conversion Helpers
+// ============================================================================
+
+/**
  * Convert package info to PackageWithDependencies format.
- * Merges requires.input and requires.content into a single dependencies array for resolution,
- * while preserving the original requires structure.
+ *
+ * Merges requires.input and requires.content into a single dependencies array
+ * for resolution, while preserving the original requires structure.
+ *
+ * @param packageInfo - The package info from registry or archive
+ * @returns Package with dependencies in resolution format
  */
 export function packageInfoToPackageWithDependencies(
   packageInfo: ArchivePackage | RegistryPackage
@@ -549,8 +741,16 @@ export function packageInfoToPackageWithDependencies(
   };
 }
 
+// ============================================================================
+// Error Helpers
+// ============================================================================
+
 /**
- * Throws appropriate errors based on resolution result
+ * Throws appropriate errors based on resolution result.
+ *
+ * @param result - The resolution result to check
+ * @throws {PackageDependencyCycleError} If a cycle was detected
+ * @throws {PackageDependencyConflictError} If conflicts were found
  */
 export function throwOnResolutionFailure(result: DependencyResolutionResult): void {
   if (result.success) return;
@@ -567,4 +767,80 @@ export function throwOnResolutionFailure(result: DependencyResolutionResult): vo
       `Cannot install packages due to dependency conflicts:\n\n${messages}`
     );
   }
+}
+
+// ============================================================================
+// Bulk Install Pre-Validation (Shared Helper)
+// ============================================================================
+
+/**
+ * Pre-validate dependencies across multiple packages before starting bulk installation.
+ *
+ * This function is used by bulk_install_packages.ts, run_bulk_upgrade.ts, and can be
+ * used by other bulk operations. It fetches package info for all packages, builds
+ * the dependency graph, and throws if there are conflicts or cycles.
+ *
+ * @param options - Validation options
+ * @throws {PackageDependencyCycleError} If a cycle is detected
+ * @throws {PackageDependencyConflictError} If conflicts are found
+ *
+ * @example
+ * ```ts
+ * await preValidateBulkInstallDependencies({
+ *   savedObjectsClient,
+ *   packages: [{ name: 'nginx', version: '1.0.0' }, { name: 'apache', version: '2.0.0' }],
+ *   logger,
+ * });
+ * // If no error thrown, safe to proceed with installation
+ * ```
+ */
+export async function preValidateBulkInstallDependencies(options: {
+  savedObjectsClient: SavedObjectsClientContract;
+  packages: Array<{ name: string; version: string }>;
+  logger: Logger;
+}): Promise<void> {
+  const { savedObjectsClient, packages, logger } = options;
+
+  // Fetch package info with dependencies for all packages
+  const packagesWithDeps: PackageWithDependencies[] = await Promise.all(
+    packages.map(async (pkg) => {
+      try {
+        const { packageInfo } = await Registry.getPackage(pkg.name, pkg.version, {
+          useStreaming: true,
+        });
+        return packageInfoToPackageWithDependencies(packageInfo);
+      } catch {
+        // If we can't fetch package info, return without dependencies
+        return { name: pkg.name, version: pkg.version };
+      }
+    })
+  );
+
+  // Only run dependency resolution if any package has dependencies
+  const hasAnyDependencies = packagesWithDeps.some(
+    (p) => p.dependencies && p.dependencies.length > 0
+  );
+
+  if (!hasAnyDependencies) {
+    return;
+  }
+
+  // Get all installed packages
+  const allPackageNames = collectAllPackageNames(packagesWithDeps);
+
+  const installedPackages = await getInstallationsByName({
+    savedObjectsClient,
+    pkgNames: Array.from(allPackageNames),
+  });
+
+  const resolution = resolveDependencies(installedPackages, packagesWithDeps);
+
+  // This will throw if there are conflicts or cycles
+  throwOnResolutionFailure(resolution);
+
+  logger.debug(
+    `Dependency resolution successful. Install order: ${resolution.installOrder
+      ?.map((p) => `${p.name}@${p.version}`)
+      .join(' -> ')}`
+  );
 }

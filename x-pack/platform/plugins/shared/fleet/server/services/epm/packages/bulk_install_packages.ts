@@ -19,13 +19,7 @@ import type { InstallResult } from '../../../types';
 
 import { installPackage, isPackageVersionOrLaterInstalled } from './install';
 import type { BulkInstallResponse, IBulkInstallPackageError } from './install';
-import {
-  resolveDependencies,
-  throwOnResolutionFailure,
-  packageInfoToPackageWithDependencies,
-  type PackageWithDependencies,
-} from './resolve_dependencies';
-import { getInstallationsByName } from './get';
+import { preValidateBulkInstallDependencies } from './resolve_dependencies';
 
 interface BulkInstallPackagesParams {
   savedObjectsClient: SavedObjectsClientContract;
@@ -109,60 +103,18 @@ export async function bulkInstallPackages({
   // Pre-validate dependencies across all packages before starting any installation
   // This ensures we catch conflicts early (e.g., package A requires dep@1.x, package B requires dep@2.x)
   const resolvedPackages = packagesResults
-      .filter((r): r is PromiseFulfilledResult<{ name: string; version: string }> =>
+    .filter(
+      (r): r is PromiseFulfilledResult<{ name: string; version: string }> =>
         r.status === 'fulfilled'
-      )
-      .map((r) => r.value);
+    )
+    .map((r) => r.value);
 
   if (resolvedPackages.length > 0) {
-    // Fetch package info with dependencies for all packages
-    const packagesWithDeps: PackageWithDependencies[] = await Promise.all(
-      resolvedPackages.map(async (pkg) => {
-        try {
-          const { packageInfo } = await Registry.getPackage(pkg.name, pkg.version, {
-            useStreaming: true,
-          });
-          return packageInfoToPackageWithDependencies(packageInfo);
-        } catch {
-          // If we can't fetch package info, return without dependencies
-          return { name: pkg.name, version: pkg.version };
-        }
-      })
-    );
-
-    // Only run dependency resolution if any package has dependencies
-    const hasAnyDependencies = packagesWithDeps.some(
-      (p) => p.dependencies && p.dependencies.length > 0
-    );
-
-    if (hasAnyDependencies) {
-      // Get all installed packages
-      const allPackageNames = new Set<string>();
-      for (const pkg of packagesWithDeps) {
-        allPackageNames.add(pkg.name);
-        if (pkg.dependencies) {
-          for (const dep of pkg.dependencies) {
-            allPackageNames.add(dep.name);
-          }
-        }
-      }
-
-      const installedPackages = await getInstallationsByName({
-        savedObjectsClient,
-        pkgNames: Array.from(allPackageNames),
-      });
-
-      const resolution = resolveDependencies(installedPackages, packagesWithDeps);
-
-      // This will throw if there are conflicts or cycles
-      throwOnResolutionFailure(resolution);
-
-      logger.debug(
-        `Dependency resolution successful for bulk install. Install order: ${resolution.installOrder
-          ?.map((p) => `${p.name}@${p.version}`)
-          .join(' -> ')}`
-      );
-    }
+    await preValidateBulkInstallDependencies({
+      savedObjectsClient,
+      packages: resolvedPackages,
+      logger,
+    });
   }
 
   const bulkInstallResults = await Promise.allSettled(
