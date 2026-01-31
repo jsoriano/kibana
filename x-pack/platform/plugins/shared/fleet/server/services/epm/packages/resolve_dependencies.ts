@@ -12,7 +12,7 @@ import semverMaxSatisfying from 'semver/ranges/max-satisfying';
 import type { Logger, SavedObjectsClientContract } from '@kbn/core/server';
 
 import type {
-  PackageDependency,
+  PackageConstraint,
   PackageRequirements,
 } from '../../../../common/types/models/package_spec';
 import type { Installation, ArchivePackage, RegistryPackage } from '../../../../common/types';
@@ -40,7 +40,7 @@ export interface PackageWithDependencies {
   /** Package version */
   version: string;
   /** Combined dependencies from requires.input and requires.content */
-  dependencies?: PackageDependency[];
+  dependencies?: PackageConstraint[];
   /** Original requires structure for type-aware operations */
   requires?: PackageRequirements;
 }
@@ -93,7 +93,7 @@ export interface DependencyResolutionResult {
 interface DependencyNode {
   name: string;
   version: string;
-  dependencies: PackageDependency[];
+  dependencies: PackageConstraint[];
   /** Constraints on this package from other packages */
   constraints: PackageConstraint[];
 }
@@ -603,7 +603,7 @@ export function resolveDependencies(
  */
 export function checkDependentsBeforeRemoval(
   packageToRemove: string,
-  installedPackages: Array<{ name: string; version: string; dependencies?: PackageDependency[] }>
+  installedPackages: Array<{ name: string; version: string; dependencies?: PackageConstraint[] }>
 ): Array<{ name: string; version: string }> {
   const dependents: Array<{ name: string; version: string }> = [];
 
@@ -728,7 +728,7 @@ export function packageInfoToPackageWithDependencies(
   packageInfo: ArchivePackage | RegistryPackage
 ): PackageWithDependencies {
   const requires = packageInfo.requires;
-  const dependencies: PackageDependency[] = [
+  const dependencies: PackageConstraint[] = [
     ...(requires?.input || []),
     ...(requires?.content || []),
   ];

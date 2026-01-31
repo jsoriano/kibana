@@ -79,29 +79,22 @@ export class PackageAlreadyInstalledError extends FleetError {}
 export class PackageRollbackError extends FleetError {}
 
 // Package dependency errors
-export class PackageDependencyError extends FleetError {}
-export class PackageDependencyConflictError extends PackageDependencyError {
+export class PackageDependencyError extends FleetError {
   constructor(message: string) {
     super(message);
     this.attributes = {
-      type: 'dependency_conflict',
+      type: 'dependency_error',
     };
   }
 }
-export class PackageDependencyCycleError extends PackageDependencyError {
+export class PackageDependencyConflictError extends PackageDependencyError {
   constructor(message: string) {
     super(message);
-    this.attributes = {
-      type: 'dependency_cycle',
-    };
   }
 }
 export class PackageDependencyValidationError extends PackageDependencyError {
   constructor(message: string) {
     super(message);
-    this.attributes = {
-      type: 'dependency_validation',
-    };
   }
 }
 export class PackageHasDependentsError extends PackageDependencyError {
@@ -113,10 +106,6 @@ export class PackageHasDependentsError extends PackageDependencyError {
     super(
       `Cannot uninstall package "${packageName}" because it is required by: ${dependentsList}`
     );
-    this.attributes = {
-      type: 'package_has_dependents',
-      dependents,
-    };
   }
 }
 

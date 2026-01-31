@@ -5,7 +5,7 @@
  * 2.0.
  */
 
-export type FleetErrorType = 'verification_failed';
+export type FleetErrorType = 'verification_failed' | 'dependency_error';
 
 export interface FleetErrorResponse {
   message: string;
